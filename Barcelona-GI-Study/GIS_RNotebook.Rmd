@@ -1,0 +1,410 @@
+---
+title: "Barcelona/LosAngelesUHIStudy"
+output: html_notebook
+---
+Make sure this notebook is located in the assignment folder, with subfolders "LA", "Barcelona" and "Plots".
+
+## Packages
+Download and install all necessary packages.
+```{r}
+list.of.packages <- c("RColorBrewer","classInt", "sp", "rgeos",
+                      "sf","rgdal","geojsonio","tidyverse","raster",
+                      "rasterVis","RStoolbox","plotly",
+                      "htmlwidgets","magrittr","viridis", "tmap", "tmaptools", "shiny", "shinyjs")
+
+#Checks whether any packages needed are not already downloaded&installed.
+#Then installs all new packages.
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])] 
+if(length(new.packages)) install.packages(new.packages)
+```
+
+Library all packages
+```{r}
+library(sf) #simplefeatures
+library(sp)
+library(rgeos)
+library(rgdal)
+library(geojsonio)
+library(raster)
+library(rasterVis)
+library(RStoolbox)
+library(plotly)
+library(tidyverse)  #prerequisite for lots of packages
+library(htmlwidgets)
+library(RColorBrewer) #color scales
+library(classInt)
+library(magrittr) #Pipes - used for plotting
+library(viridis)  #color scales
+library(tmap)
+library(tmaptools)
+library(shiny)
+library(shinyjs)
+```
+
+### Barcelona
+Store GeoJSON of Barcelona outline into simple features object. This is used later for cropping the raster.
+Also need to change the projection of the barcelona outline to match the projection of raster file
+```{r}
+barcelonaSF <- st_read("Barcelona/Barcelona.geojson")
+newProjection <- "+proj=utm +zone=31 +datum=WGS84 +units=m +no_defs"
+barcelonaSF <- st_transform(barcelonaSF, newProjection)
+```
+
+## RASTER PRE-PROCESSING
+Read in the meta file, and stack the raster bands using the meta file. this is faster than reading in traditionally.
+Atmospheric processing, applying DOS2 correction from chavez (1996).
+```{r}
+barcMTL <- readMeta("Barcelona/May_10_19/LC08_L1TP_198031_20190510_20190521_01_T1_MTL.txt")
+espRS <- stackMeta("Barcelona/May_10_19/LC08_L1TP_198031_20190510_20190521_01_T1_MTL.txt")
+#determine the SHV on the blue band (B2), with a dark prop of 1% 
+hazeDN <- estimateHaze(espRS, hazeBands = "B2_dn", darkProp = 0.01) 
+#correct atmospherical scattering to deliver surface reflectance.
+atmCorrectedRS <- radCor(espRS, metaData = barcMTL,
+                         method = "costz",hazeValues = hazeDN, hazeBands = "B2_dn")
+hazeDN
+```
+
+Crop the Corrected Raster to the Barcelona extent and border.
+```{r}
+barcelonaBound <- as(barcelonaSF, Class = "Spatial")
+barcelonaExtent <- extent(barcelonaBound)
+barcelonaRSCrop <- crop(atmCorrectedRS, barcelonaExtent)
+barcelonaRSMask <- mask(barcelonaRSCrop, barcelonaBound)
+```
+
+## PROCESSING - SAVI, IBI, LST, UHI, UHS, UTFVI
+Create Index Function.
+```{r}
+indexFunction <- function(band1, band2) {
+  Index <- (band1 - band2) / (band1 + band2)
+  return(Index)
+}
+```
+SAVI
+used to detect vegetation over NDVI because more sensitive for areas where vegetation density is low (i.e cities)
+L = Constant that depends on amount of vegetation,
+0 = highest vegetation density, 1 = lowest vegetation density.
+Generally taken as 0.5.
+```{r}
+L = 0.5
+barcelonaSAVI <- ((barcelonaRSMask$B5_sre - barcelonaRSMask$B4_sre)*(1+L))/
+                    (barcelonaRSMask$B5_sre + barcelonaRSMask$B4_sre + L)
+```
+MNDWI
+used to extract water from landsat8, more sensitive to areas such as cities where water is not commonly found.
+```{r}
+barcelonaMNDWI <- indexFunction(barcelonaRSMask$B3_sre,barcelonaRSMask$B6_sre)
+```
+
+IBI
+We can now use both of these indexes to just extract built land using IBI.
+Need to add one to all indices to remove negative numbers for calculation first.
+```{r}
+NDBI1 <- barcelonaNDBI + 1
+SAVI1 <- barcelonaSAVI + 1
+MNDWI1 <- barcelonaMNDWI + 1
+barcelonaIBI <- ((NDBI1-((SAVI1+MNDWI1)/2))/
+                   (NDBI1+((SAVI1+MNDWI1)/2)))
+```
+
+##LST
+As we have performed atmospheric correction, we already have the Brightness temperature values in bands 10.#So no need to recalculate.
+```{r}
+barcBT1 <- barcelonaRSMask$B10_bt
+
+```
+
+Next calculate fractional vegetation value using SAVI values. This used to calculate emissivity. 
+
+```{r}
+barcFracV=(barcelonaSAVI-0.2/0.5-0.2)^2
+emiss1=0.004*barcFracV+0.986
+```
+
+p calculation and define lambda
+```{r}
+Boltzmann=1.38*10e-23
+Plank=6.626*10e-34
+c=2.998*10e8
+p=Plank*(c/Boltzmann)
+lambda=1.09e-5
+
+```
+Finally calculate LST equation and convert to celsius
+```{r}
+barcLST <-barcBT1/(1 +(lambda*barcBT1/p)*log(emiss1))
+barcLST<-barcLST-273.15
+```
+## Determining UHI, non-UHI, UHS and UTFVI
+```{r}
+sd1 <- cellStats(barcLST, stat = "sd")
+mean1 <- cellStats(barcLST, stat = "mean")
+barcUHI <- barcLST > (mean1 + (0.5*sd1))     #(Ma,Kuang & Huang 2010)
+barcNonUHI <- barcLST <= (mean1 + (0.5*sd1)) #(Guha,Govil & Mukherjee 2017)
+barcUHS <- barcLST > (mean1 + (2*sd1))
+barcUTFVI <- (barcLST - mean1)/mean1
+```
+
+## LOS ANGELES
+Same process as barcelona, so putting all in one chunk (May take 10 mins or so to run.)
+
+```{r}
+laSF <- st_read("LA/LosAngeles.geojson")
+
+laMTL <- readMeta("LA/May_30_19/LC08_L1TP_041036_20190530_20190605_01_T1_MTL.txt")
+laRS <- stackMeta("LA/May_30_19/LC08_L1TP_041036_20190530_20190605_01_T1_MTL.txt")
+newProjection <- "+proj=utm +zone=11 +datum=WGS84 +units=m +no_defs"
+laSF <- st_transform(laSF, newProjection)
+hazeDN1 <- estimateHaze(laRS, hazeBands = "B2_dn", darkProp = 0.01)
+laCorRS <- radCor(laRS, metaData = laMTL,
+                         method = "costz",hazeValues = hazeDN1, hazeBands = "B2_dn")
+
+laBound <- as(laSF, Class = "Spatial")
+laExtent <- extent(laBound)
+laRSCrop <- crop(laCorRS, laExtent)
+laRSMask <- mask(laRSCrop, laBound)
+
+L = 0.5
+laSAVI <- ((laRSMask$B5_sre - laRSMask$B4_sre)*(1+L))/
+                    (laRSMask$B5_sre + laRSMask$B4_sre + L)
+laNDBI <- indexFunction(laRSMask$B6_sre, laRSMask$B5_sre)
+laMNDWI <- indexFunction(laRSMask$B3_sre,laRSMask$B6_sre)
+NDBI2 <- laNDBI + 1
+SAVI2 <- laSAVI + 1
+MNDWI2 <- laMNDWI + 1
+laIBI <- (NDBI2-(SAVI2+MNDWI2)/2)/
+            (NDBI2+(SAVI2+MNDWI2)/2)
+
+laBT <- laRSMask$B10_bt
+laFracV=(laSAVI-0.2/0.5-0.2)^2
+emiss2=0.004*laFracV+0.986
+Boltzmann=1.38*10e-23
+Plank=6.626*10e-34
+c=2.998*10e8
+p=Plank*(c/Boltzmann)
+lambda=1.09e-5
+laLST <-laBT/(1 +(lambda*laBT/p)*log(emiss2))
+laLST<-laLST-273.15
+
+sd2 <- cellStats(laLST, stat = "sd")
+mean2 <- cellStats(laLST, stat = "mean")
+laUHI <- laLST > (mean2 + (0.5*sd2))      
+laNonUHI <- laLST <= (mean2 + (0.5*sd2))  
+laUHS <- laLST > (mean2 + (2*sd2))  
+laUTFVI <- (laLST - mean2)/mean2
+
+```
+
+## PLOTTING
+Create map functions for plotting barcelona and LA, so that dont need to rewrite everytime.
+Store colour palettes and SAVI breaks too.
+```{r}
+createMap <- function(ras, geoshp, colour,br, legTitle, Mtitle){
+  tm_shape(ras) + 
+    tm_raster(style = "fixed", title = Mtitle,
+              
+              palette = colour, midpoint = NA, breaks = br)+
+    tm_legend(outside = FALSE, legend.position = c("right", "bottom"))+
+    tm_shape(geoshp) + 
+    tm_borders(alpha =  0.4, col = "black") + 
+    tm_layout(inner.margins = c(0.1, 0.1, 0.1, 0.1),
+              title = legTitle,
+              title.size = 1.1,
+              title.position = c("center", "top")) +
+    tm_compass(type = "4star", size = 3, text.size = 1,position = c("left", "top")) +
+    tm_scale_bar(position = c("left","bottom"))
+  
+}
+createMap2 <- function(ras, geoshp, colour,br, legTitle, Mtitle){
+  tm_shape(ras) + 
+    tm_raster(style = "fixed", title = Mtitle,
+              
+              palette = colour, midpoint = NA, breaks = br)+
+    tm_legend(outside = FALSE, legend.position = c("left", "bottom"))+
+    tm_shape(geoshp) + 
+    tm_borders(alpha =  0.4, col = "black") + 
+    tm_layout(inner.margins = c(0.08, 0.1, 0.1, 0.1),
+              title = legTitle,
+              title.size = 1.1,
+              title.position = c("center", "top")) +
+    tm_compass(type = "4star", size = 3, text.size = 1,position = c("left", "top")) +
+    tm_scale_bar(position = c("right","bottom"))
+  
+}
+#Colour palettes
+RedGreen <- c("#A93226","#E67E22","#F1C40F","#52BE80","#196F3D")
+GreenRed <- c("#196F3D","#52BE80","#F1C40F","#E67E22","#A93226")
+#Break points for SAVI threshold intervals
+cuts = c(-1,0,0.1, 0.2, 0.3,1)
+```
+
+Create Maps for LST, IBI, SAVI distributions
+```{r}
+SAVImap1 <- createMap(barcelonaSAVI, barcelonaSF, RedGreen, cuts, "Barcelona - SAVI","SAVI")
+SAVImap2 <- createMap2(laSAVI, laSF, RedGreen, cuts, "Los Angeles - SAVI", "SAVI")
+
+SAVIplot <- tmap_arrange(SAVImap1, SAVImap2, ncol = 2)
+SAVIplot
+
+IBImap1 <- createMap(barcelonaIBI, barcelonaSF, GreenRed, c(-1,-0.2,-0.1,0,0.1,1), "Barcelona - IBI", "IBI")
+IBImap2 <- createMap2(laIBI, laSF, GreenRed, c(-1,-0.2,-0.1,0,0.1,1), "Los Angeles - IBI", "IBI")
+IBIplot <- tmap_arrange(IBImap1, IBImap2, ncol=2)
+IBIplot
+LSTmap1 <- createMap(barcLST, barcelonaSF, GreenRed, c(14,22, 24, 25, 26,30, 36),"Barcelona - LST", "LST (Celsius)")
+LSTmap2 <- createMap2(laLST, laSF, GreenRed, c(14,22,30,33,36,40,48), "Los Angeles - LST", "LST (Celsius)")
+LSTmap <- tmap_arrange(LSTmap1, LSTmap2, ncol=2)
+LSTmap
+```
+
+Crop LST to UHI map to work out midpoints for next plot.
+```{r}
+bUHIcrop <- mask(barcLST, barcUHI, maskvalue = 0, updatevalue = NA)
+bNUHIcrop <- mask(barcLST,barcUHI, maskvalue = 1, updatevalue = NA)
+lUHIcrop <- mask(laLST, laUHI, maskvalue = 0, updatevalue = NA)
+lNUHIcrop <- mask(laLST, laUHI, maskvalue = 1, updatevalue = NA)
+bUHScrop <- mask(barcLST, barcUHS, maskvalue = 0, updatevalue = NA)
+lUHScrop <- mask(laLST, laUHS, maskvalue = 0, updatevalue = NA)
+#Simply find minimum value of bUHIcrop and lUHIcrop to use as midpoints in next plot.
+UHImap1 <- tm_shape(barcLST) +
+  tm_raster(style = "cont", title = "LST (Celsius)", midpoint = 25.764, palette = "-RdYlGn",n = 9, contrast = c(0.4, 1)) +
+  tm_legend(outside = FALSE, legend.position = c("right", "bottom"))+
+  tm_shape(barcelonaSF) + 
+  tm_borders(alpha =  0.4, col = "black") + 
+  tm_layout(inner.margins = c(0.05, 0.02, 0.13, 0.1),
+            title = "Barcelona LST\n UHI & Non-UHI",
+            title.size = 1.1,
+            title.position = c("center", "top")) +
+  tm_compass(type = "4star", size = 2.5, text.size = 0.8,position = c("left", "top")) +
+  tm_scale_bar(position = c("left","bottom"))
+
+
+UHImap2 <- tm_shape(laLST) +
+  tm_raster(style = "cont", title = "LST (Celsius)", midpoint = 35.51689, palette = "-RdYlGn",n = 9, contrast = c(0.4, 1)) +
+  tm_legend(outside = FALSE, legend.position = c("left", "bottom"))+
+  tm_shape(laSF) + 
+  tm_borders(alpha =  0.4, col = "black") + 
+  tm_layout(inner.margins = c(0.08, 0.1, 0.13, 0.1),
+            title = "Los Angeles LST\n UHI & Non-UHI",
+            title.size = 1.1,
+            title.position = c("center", "top")) +
+  tm_compass(type = "4star", size = 2.5, text.size = 0.8,position = c("left", "top")) +
+  tm_scale_bar(position = c("right","bottom"))
+
+UHIplot <- tmap_arrange(UHImap1, UHImap2, ncol = 2)
+UHIplot
+```
+
+UTFVI and UHS plots
+```{r}
+UTFVIbins <- c(-1,0,0.005,0.01,0.015,0.02,1)
+UTFVImap1 <- createMap(barcUTFVI, barcelonaSF, GreenRed, UTFVIbins, "Barcelona - UTFVI", "UTFVI")
+UTFVImap2 <- createMap2(laUTFVI, laSF, GreenRed, UTFVIbins, "Los Angeles - UTFVI", "UTFVI")
+UTFVIplot <- tmap_arrange(UTFVImap1, UTFVImap2, ncol = 2)
+UTFVIplot
+
+UHSmap1 <- tm_shape(barcUHS) +
+  tm_raster(style = 'cont',title = "Legend" ,palette = c("white", "red"), labels = c("Barcelona","Urban Hot Spots"))+
+  tm_legend(outside = F, legend.position = c("right", "bottom"), frame = "black")+
+  tm_shape(barcelonaSF) +
+  tm_borders(alpha = 0.4, col = "black") +
+  tm_layout(inner.margins = c(0.05, 0.02, 0.13, 0.1), 
+            title = "Barcelona - Urban Heat Spots (UHS)",
+            title.size = 1.1,
+            title.position = c("center", "top")) +
+  tm_compass(type = "4star", size = 2.5, text.size = 0.8,position = c("left", "top")) +
+  tm_scale_bar(position = c("left","bottom"))
+
+UHSmap2 <- tm_shape(laUHS) +
+  tm_raster(style = 'cont',title = "Legend" ,palette = c("white", "red"), labels = c("Los Angeles","Urban Hot Spots"))+
+  tm_legend(outside = F, legend.position = c("right", "bottom"), frame = "black")+
+  tm_shape(laSF) +
+  tm_borders(alpha = 0.4, col = "black") +
+  tm_layout(inner.margins = c(0.05, 0.2, 0.13, 0.2), 
+            title = "Los Angeles - Urban Heat Spots (UHS)",
+            title.size = 1.1,
+            title.position = c("center", "top")) +
+  tm_compass(type = "4star", size = 2.5, text.size = 0.8,position = c("left", "top")) +
+  tm_scale_bar(position = c("left","bottom"))
+UHSmap1
+UHSmap2
+
+```
+
+Work out the area % of UTFVI
+```{r}
+utfviDF1 <- as.data.frame(na.omit(values(barcUTFVI)))
+utfviDF2 <- as.data.frame(na.omit(values(laUTFVI)))
+
+bclass1 <- sum(utfviDF1[] < 0)
+bclass2 <- sum(utfviDF1[] >= 0 & utfviDF1[] < 0.005)
+bclass3 <- sum(utfviDF1[] >= 0.005 & utfviDF1[] < 0.01)
+bclass4 <- sum(utfviDF1[] >= 0.01 & utfviDF1[] < 0.015)
+bclass5 <- sum(utfviDF1[] >= 0.015 & utfviDF1[] < 0.02)
+bclass6 <- sum(utfviDF1[] >= 0.02)
+
+bTot <- bclass1+bclass2+bclass3+bclass4+bclass5+bclass6
+b1 <- (bclass1/bTot)*100
+b2 <- (bclass2/bTot)*100
+b3 <- (bclass3/bTot)*100
+b4 <- (bclass4/bTot)*100
+b5 <- (bclass5/bTot)*100
+b6 <- (bclass6/bTot)*100
+
+lclass1 <- sum(utfviDF2[] < 0)
+lclass2 <- sum(utfviDF2[] >= 0 & utfviDF2[] < 0.005)
+lclass3 <- sum(utfviDF2[] >= 0.005 & utfviDF2[] < 0.01)
+lclass4 <- sum(utfviDF2[] >= 0.01 & utfviDF2[] < 0.015)
+lclass5 <- sum(utfviDF2[] >= 0.015 & utfviDF2[] < 0.02)
+lclass6 <- sum(utfviDF2[] >= 0.02)
+
+lTot <- lclass1+lclass2+lclass3+lclass4+lclass5+lclass6
+l1 <- (lclass1/lTot)*100
+l2 <- (lclass2/lTot)*100
+l3 <- (lclass3/lTot)*100
+l4 <- (lclass4/lTot)*100
+l5 <- (lclass5/lTot)*100
+l6 <- (lclass6/lTot)*100
+
+b1
+b2
+b3
+b4
+b5
+b6
+l1
+l2
+l3
+l4
+l5
+l6
+```
+## Linear relationships
+stack all data that you want to explore the relationship of, and then convert to dataframe.
+remove null values too.
+```{r}
+barcStack <- stack(barcLST, barcelonaSAVI, barcelonaIBI)
+barcDF <- as.data.frame(na.omit(values(barcStack)))
+laStack <- stack(laLST, laSAVI, laIBI)
+laDF <- as.data.frame(na.omit(values(laStack)))
+#barcelona
+bTempVeg <- lm(layer.2~layer.1, data = barcDF)
+summary(bTempVeg)
+bTempIBI <- lm(layer.3 ~ layer.1, data = barcDF)
+summary(bTempIBI)
+#LA
+lTempVeg <- lm(layer.2~layer.1, data = laDF)
+summary(lTempVeg)
+lTempIBI <- lm(layer.3 ~ layer.1, data = laDF)
+summary(lTempIBI)
+```
+## Write out plots
+```{r}
+tmap_save(SAVIplot, filename = "Plots/SAVIplot.png")
+tmap_save(UHIplot, filename = "Plots/UHIplot.png")
+tmap_save(UHSmap1, filename = "Plots/UHSbarcelona.png")
+tmap_save(UHSmap2, filename = "Plots/UHSla.png")
+tmap_save(IBIplot, filename = "Plots/IBIplot.png")
+tmap_save(LSTmap, filename = "Plots/LSTplot.png")
+tmap_save(UTFVIplot, filename = "Plots/UTFVIplot.png")
+```
+
